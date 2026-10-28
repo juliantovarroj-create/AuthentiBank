@@ -1,0 +1,565 @@
+from __future__ import annotations
+
+import math
+import sys
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime
+
+
+# =====================================================================
+# UTILIDADES
+# =====================================================================
+
+def cop(valor: float) -> str:
+    """Da formato de pesos colombianos: 1500000 -> $1.500.000"""
+    signo = "-" if valor < 0 else ""
+    return f"{signo}${abs(valor):,.0f}".replace(",", ".")
+
+
+# =====================================================================
+# EXCEPCIONES PERSONALIZADAS
+# =====================================================================
+
+class BancoError(Exception):
+    """Base de todos los errores del banco."""
+
+
+class SaldoInsuficienteError(BancoError):
+    """El retiro dejaría la cuenta por debajo de lo permitido."""
+
+
+class PinIncorrectoError(BancoError):
+    """El PIN ingresado no coincide con el registrado."""
+
+
+class CuentaBloqueadaError(BancoError):
+    """La cuenta superó el máximo de intentos fallidos de PIN."""
+
+
+class TarjetaNoRegistradaError(BancoError):
+    """El UID leído no pertenece a ninguna tarjeta registrada."""
+
+
+class MontoInvalidoError(BancoError):
+    """El monto no es válido (cero, negativo o con formato incorrecto)."""
+
+
+class PinInvalidoError(BancoError):
+    """El PIN nuevo no cumple el formato o no se pudo confirmar."""
+
+
+# =====================================================================
+# CUENTAS (encapsulamiento + herencia + polimorfismo)
+# =====================================================================
+
+@dataclass(frozen=True)
+class Transaccion:
+    tipo: str
+    monto: float
+    saldo_resultante: float
+    fecha: datetime
+
+
+class Cuenta(ABC):
+    """
+    Clase base abstracta. El saldo es privado: solo cambia a través de
+    depositar() y retirar(), que son los únicos puntos donde se valida
+    cada regla de negocio.
+    """
+
+    def __init__(self, numero: str, saldo_inicial: float) -> None:
+        self.__numero = numero
+        self.__saldo = saldo_inicial
+        self.__movimientos: list[Transaccion] = []
+
+    # --- solo lectura desde afuera ---
+    @property
+    def numero(self) -> str:
+        return self.__numero
+
+    @property
+    def saldo(self) -> float:
+        return self.__saldo
+
+    @property
+    def movimientos(self) -> list[Transaccion]:
+        return list(self.__movimientos) # copia: no se puede alterar el historial
+
+    @property
+    def disponible(self) -> float:
+        return self.__saldo
+
+    @property
+    @abstractmethod
+    def tipo(self) -> str: ...
+
+    # --- operaciones ---
+    def depositar(self, monto: float) -> None:
+        self._validar_monto(monto)
+        self.__saldo += monto
+        self.__registrar("Depósito", monto)
+
+    def retirar(self, monto: float) -> None:
+        self._validar_monto(monto)
+        self._validar_fondos(monto) # polimorfismo: cada cuenta aplica su regla
+        self.__saldo -= monto
+        self.__registrar("Retiro", -monto)
+
+    @abstractmethod
+    def _validar_fondos(self, monto: float) -> None:
+        """Lanza SaldoInsuficienteError si el retiro no está permitido."""
+
+    @staticmethod
+    def _validar_monto(monto: float) -> None:
+        if isinstance(monto, bool) or not isinstance(monto, (int, float)) \
+                or not math.isfinite(monto) or monto <= 0:
+            raise MontoInvalidoError("El monto debe ser mayor a cero.")
+
+    def __registrar(self, tipo: str, monto: float) -> None:
+        self.__movimientos.append(Transaccion(tipo, monto, self.__saldo, datetime.now()))
+
+
+class CuentaAhorros(Cuenta):
+    """Regla de negocio: jamás puede quedar con saldo negativo."""
+
+    @property
+    def tipo(self) -> str:
+        return "Cuenta de ahorros"
+
+    def _validar_fondos(self, monto: float) -> None:
+        if monto > self.saldo:
+            raise SaldoInsuficienteError(
+                f"Saldo insuficiente en la cuenta de ahorros {self.numero}. "
+                f"Disponible: {cop(self.saldo)}."
+            )
+
+
+class CuentaCorriente(Cuenta):
+    """Regla de negocio: permite sobregiro, pero solo hasta un cupo fijo."""
+
+    def __init__(self, numero: str, saldo_inicial: float, limite_sobregiro: float) -> None:
+        super().__init__(numero, saldo_inicial)
+        self.__limite_sobregiro = limite_sobregiro
+
+    @property
+    def tipo(self) -> str:
+        return "Cuenta corriente"
+
+    @property
+    def limite_sobregiro(self) -> float:
+        return self.__limite_sobregiro
+
+    @property
+    def disponible(self) -> float:
+        return self.saldo + self.__limite_sobregiro
+
+    def _validar_fondos(self, monto: float) -> None:
+        if self.saldo - monto < -self.__limite_sobregiro:
+            raise SaldoInsuficienteError(
+                f"Retiro rechazado en la cuenta corriente {self.numero}: supera el cupo "
+                f"de sobregiro de {cop(self.__limite_sobregiro)}. Disponible: {cop(self.disponible)}."
+            )
+
+
+# =====================================================================
+# USUARIO (PIN encapsulado + bloqueo por intentos fallidos)
+# =====================================================================
+
+class Usuario:
+    MAX_INTENTOS = 3
+
+    def __init__(self, nombre: str, pin: str, cuenta: Cuenta) -> None:
+        self.__nombre = nombre
+        self.__pin = pin # en un sistema real: hash + salt, nunca texto plano
+        self.__cuenta = cuenta
+        self.__intentos_fallidos = 0
+        self.__bloqueado = False
+
+    @property
+    def nombre(self) -> str:
+        return self.__nombre
+
+    @property
+    def cuenta(self) -> Cuenta:
+        return self.__cuenta
+
+    @property
+    def bloqueado(self) -> bool:
+        return self.__bloqueado
+
+    @property
+    def intentos_restantes(self) -> int:
+        return self.MAX_INTENTOS - self.__intentos_fallidos
+
+    def verificar_pin(self, pin_ingresado: str) -> None:
+        """
+        Segundo factor. Lanza excepción en vez de devolver False, para que el
+        bloqueo por intentos fallidos no se pueda ignorar por accidente.
+        """
+        if self.__bloqueado:
+            raise CuentaBloqueadaError(
+                f"La cuenta de {self.__nombre} está bloqueada por intentos fallidos."
+            )
+
+        if self.__pin != pin_ingresado:
+            self.__intentos_fallidos += 1
+            if self.__intentos_fallidos >= self.MAX_INTENTOS:
+                self.__bloqueado = True
+                raise CuentaBloqueadaError(
+                    f"PIN incorrecto. Se alcanzó el máximo de {self.MAX_INTENTOS} intentos: "
+                    f"la cuenta de {self.__nombre} quedó bloqueada."
+                )
+            raise PinIncorrectoError(
+                f"PIN incorrecto. Intento {self.__intentos_fallidos} de {self.MAX_INTENTOS}."
+            )
+
+        self.__intentos_fallidos = 0 # PIN correcto: se reinician los intentos
+
+    def cambiar_pin(self, pin_actual: str, pin_nuevo: str) -> None:
+        self.verificar_pin(pin_actual)
+        if not (pin_nuevo.isascii() and pin_nuevo.isdigit() and len(pin_nuevo) == 4):
+            raise PinInvalidoError("El PIN nuevo debe tener exactamente 4 dígitos.")
+        if pin_nuevo == pin_actual:
+            raise PinInvalidoError("El PIN nuevo debe ser distinto al actual.")
+        self.__pin = pin_nuevo
+
+
+# =====================================================================
+# AUTENTICADOR (primer factor: tarjeta / segundo factor: PIN)
+# =====================================================================
+
+class AutenticadorRFID:
+    def __init__(self) -> None:
+        # UID -> Usuario. En un caso real vendría de una base de datos.
+        self.__tarjetas: dict[str, Usuario] = {}
+
+    def registrar_tarjeta(self, uid: str, usuario: Usuario) -> None:
+        self.__tarjetas[uid.strip().upper()] = usuario
+
+    def validar_tarjeta(self, uid: str) -> Usuario:
+        usuario = self.__tarjetas.get(uid.strip().upper())
+        if usuario is None:
+            raise TarjetaNoRegistradaError(
+                f"La tarjeta con UID {uid} no está registrada en el sistema."
+            )
+        return usuario
+
+    def validar_pin(self, usuario: Usuario, pin_ingresado: str) -> None:
+        usuario.verificar_pin(pin_ingresado)
+
+
+# =====================================================================
+# LECTORES DE TARJETA (intercambiables)
+# =====================================================================
+
+class LectorTarjeta(ABC):
+    """Al cajero le da igual de dónde venga el UID: solo necesita recibirlo."""
+
+    @abstractmethod
+    def esperar_tarjeta(self) -> str | None:
+        """Devuelve el UID leído, o None si se quiere terminar el programa."""
+
+    def cerrar(self) -> None:
+        pass
+
+
+class LectorSimulado(LectorTarjeta):
+    """Sin hardware: el UID se escribe con el teclado."""
+
+    def esperar_tarjeta(self) -> str | None:
+        texto = input("\nUID de la tarjeta (o 'salir') > ").strip()
+        return None if texto.lower() == "salir" else texto
+
+
+class LectorSerial(LectorTarjeta):
+    """Con hardware: lee el UID que el Arduino (MFRC522) envía por el puerto serial."""
+
+    def __init__(self, puerto: str, baudios: int = 9600) -> None:
+        try:
+            import serial # pyserial
+        except ImportError as e:
+            raise RuntimeError("Falta pyserial. Instálalo con: pip install pyserial") from e
+        self.__error_serial = serial.SerialException
+        try:
+            self.__serial = serial.Serial(puerto, baudios, timeout=1)
+        except serial.SerialException as e:
+            raise RuntimeError(
+                f"No se pudo abrir el puerto {puerto}. Revisa el nombre con "
+                f"'python authentibank.py listar' y que el Monitor Serie del Arduino IDE "
+                f"esté cerrado. Detalle: {e}"
+            ) from e
+        time.sleep(2) # el Arduino se reinicia al abrir el puerto
+        print(f"Escuchando lector RFID en {puerto}...")
+
+    def esperar_tarjeta(self) -> str | None:
+        try:
+            while True:
+                linea = self.__serial.readline().decode("utf-8", errors="ignore").strip()
+                if linea:
+                    self.__serial.reset_input_buffer() # descarta lecturas repetidas
+                    return linea
+        except self.__error_serial as e:
+            raise RuntimeError(
+                "Se perdió la conexión con el lector. ¿Se desconectó el cable USB del Arduino?"
+            ) from e
+
+    def cerrar(self) -> None:
+        self.__serial.close()
+
+
+def listar_puertos() -> None:
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        print("Falta pyserial. Instálalo con: pip install pyserial")
+        return
+    puertos = list(list_ports.comports())
+    if not puertos:
+        print("No se encontraron puertos seriales.")
+    for p in puertos:
+        print(f"{p.device} -> {p.description}")
+
+
+# =====================================================================
+# REGLAS PROPIAS DEL CAJERO (dispensador de billetes)
+# =====================================================================
+
+class Cajero:
+    BILLETE_MINIMO = 10_000
+
+    @staticmethod
+    def retirar(cuenta: Cuenta, monto: int) -> None:
+        if monto % Cajero.BILLETE_MINIMO != 0 and monto > 0:
+            raise MontoInvalidoError(
+                "El cajero entrega billetes de $10.000, $20.000 y $50.000. "
+                "El monto debe ser múltiplo de $10.000."
+            )
+        cuenta.retirar(monto)
+
+    @staticmethod
+    def depositar(cuenta: Cuenta, monto: int) -> None:
+        cuenta.depositar(monto)
+
+
+# =====================================================================
+# DATOS DE PRUEBA
+# =====================================================================
+
+def crear_autenticador() -> AutenticadorRFID:
+    aut = AutenticadorRFID()
+    # IMPORTANTE: cambia estos UID por los de tus tarjetas reales.
+    aut.registrar_tarjeta("A3:4F:12:8B", Usuario("Sebas", "1234", CuentaAhorros("AH-001", 500_000)))
+    aut.registrar_tarjeta("11:22:33:44", Usuario("Laura", "4321", CuentaCorriente("CO-001", 200_000, 100_000)))
+    aut.registrar_tarjeta("55:66:77:88", Usuario("Carlos", "0000", CuentaAhorros("AH-002", 80_000)))
+    return aut
+
+
+# =====================================================================
+# APLICACIÓN DE CONSOLA
+# =====================================================================
+
+def leer_monto(prompt: str = "Monto > ") -> int:
+    texto = input(prompt).strip()
+    limpio = texto.replace("$", "").replace(".", "").replace(",", "")
+    if not limpio.isascii() or not limpio.isdigit():
+        raise MontoInvalidoError(f"El monto '{texto}' no es un número válido.")
+    return int(limpio)
+
+
+def cambiar_pin(usuario: Usuario) -> None:
+    actual = input("PIN actual > ").strip()
+    nuevo = input("PIN nuevo (4 dígitos) > ").strip()
+    confirmar = input("Repita el PIN nuevo > ").strip()
+    if nuevo != confirmar:
+        raise PinInvalidoError("Los PIN no coinciden. No se cambió nada.")
+    usuario.cambiar_pin(actual, nuevo)
+    print("PIN actualizado. Úselo en su próxima sesión.")
+
+
+def mostrar_saldo(usuario: Usuario) -> None:
+    c = usuario.cuenta
+    print(f"\n{c.tipo} {c.numero} - Titular: {usuario.nombre}")
+    print(f"Saldo: {cop(c.saldo)}")
+    if isinstance(c, CuentaCorriente):
+        print(f"Cupo de sobregiro: {cop(c.limite_sobregiro)} | Disponible: {cop(c.disponible)}")
+
+
+def mostrar_movimientos(usuario: Usuario) -> None:
+    movs = usuario.cuenta.movimientos[-6:][::-1]
+    if not movs:
+        print("Aún no hay movimientos.")
+        return
+    print(f"\n{'Hora':<10}{'Tipo':<12}{'Valor':>15}{'Saldo':>15}")
+    for m in movs:
+        print(f"{m.fecha:%H:%M:%S} {m.tipo:<12}{cop(m.monto):>15}{cop(m.saldo_resultante):>15}")
+
+
+def menu(usuario: Usuario) -> None:
+    cuenta = usuario.cuenta
+    while True:
+        print("\n1) Consultar saldo 2) Depositar 3) Retirar 4) Movimientos 5) Cambiar PIN 6) Salir")
+        opcion = input("Opción > ").strip()
+        try:
+            if opcion == "1":
+                mostrar_saldo(usuario)
+            elif opcion == "2":
+                Cajero.depositar(cuenta, leer_monto())
+                print(f"Depósito exitoso. Saldo: {cop(cuenta.saldo)}")
+            elif opcion == "3":
+                Cajero.retirar(cuenta, leer_monto())
+                print(f"Retiro exitoso. Saldo: {cop(cuenta.saldo)}")
+            elif opcion == "4":
+                mostrar_movimientos(usuario)
+            elif opcion == "5":
+                cambiar_pin(usuario)
+            elif opcion == "6":
+                print("Sesión cerrada. Retire su tarjeta.")
+                return
+            else:
+                print("Opción no válida.")
+        except CuentaBloqueadaError as e:
+            print(f"BLOQUEADA: {e}")
+            return
+        except BancoError as e:
+            print(f"OPERACIÓN RECHAZADA: {e}")
+
+
+def atender_sesion(autenticador: AutenticadorRFID, uid: str) -> None:
+    try:
+        usuario = autenticador.validar_tarjeta(uid)
+    except TarjetaNoRegistradaError as e:
+        print(f"ACCESO DENEGADO: {e}")
+        return
+
+    print(f"Tarjeta reconocida. Hola, {usuario.nombre}.")
+
+    while True: # segundo factor: PIN
+        pin = input("PIN > ").strip()
+        try:
+            autenticador.validar_pin(usuario, pin)
+            break
+        except PinIncorrectoError as e:
+            print(e)
+        except CuentaBloqueadaError as e:
+            print(f"BLOQUEADA: {e}")
+            return
+
+    menu(usuario)
+
+
+# =====================================================================
+# DEMOSTRACIÓN AUTOMÁTICA
+# =====================================================================
+
+def _titulo(texto: str) -> None:
+    print(f"\n=== {texto} ===")
+
+
+def _iniciar_sesion(aut: AutenticadorRFID, uid: str, *pines: str) -> Usuario | None:
+    """Simula pasar la tarjeta y probar PINs en orden hasta que uno funcione o se bloquee."""
+    try:
+        usuario = aut.validar_tarjeta(uid)
+    except TarjetaNoRegistradaError as e:
+        print(f"ACCESO DENEGADO: {e}")
+        return None
+    print(f"Tarjeta reconocida: {usuario.nombre}")
+    for pin in pines:
+        try:
+            aut.validar_pin(usuario, pin)
+            print("PIN correcto. Acceso concedido.")
+            return usuario
+        except PinIncorrectoError as e:
+            print(f" {e}")
+        except CuentaBloqueadaError as e:
+            print(f" BLOQUEADA: {e}")
+            return None
+    return None
+
+
+def _operar(cuenta: Cuenta, accion: str, monto: int) -> None:
+    try:
+        if accion == "retiro":
+            Cajero.retirar(cuenta, monto)
+            print(f"Retiro de {cop(monto)} OK. Saldo: {cop(cuenta.saldo)}")
+        else:
+            Cajero.depositar(cuenta, monto)
+            print(f"Depósito de {cop(monto)} OK. Saldo: {cop(cuenta.saldo)}")
+    except BancoError as e:
+        print(f"OPERACIÓN RECHAZADA: {e}")
+
+
+def ejecutar_demo() -> None:
+    aut = crear_autenticador()
+
+    _titulo("1. Tarjeta NO registrada")
+    _iniciar_sesion(aut, "FF:FF:FF:FF", "0000")
+
+    _titulo("2. Cuenta de ahorros (Sebas)")
+    sebas = _iniciar_sesion(aut, "A3:4F:12:8B", "9999", "1234") # primero falla, luego acierta
+    if sebas:
+        print(f"Saldo: {cop(sebas.cuenta.saldo)}")
+        _operar(sebas.cuenta, "deposito", 50_000)
+        _operar(sebas.cuenta, "retiro", 700_000) # rechazado: saldo insuficiente
+        _operar(sebas.cuenta, "retiro", 200_000) # válido
+        _operar(sebas.cuenta, "retiro", 15_000) # rechazado: no es múltiplo de $10.000
+        _operar(sebas.cuenta, "retiro", -5) # rechazado: monto inválido
+
+    _titulo("3. Cuenta corriente con sobregiro (Laura)")
+    laura = _iniciar_sesion(aut, "11:22:33:44", "4321")
+    if laura:
+        _operar(laura.cuenta, "retiro", 250_000) # permitido: queda en -$50.000
+        _operar(laura.cuenta, "retiro", 100_000) # rechazado: supera el cupo
+
+    _titulo("4. Bloqueo por 3 PIN incorrectos (Carlos)")
+    _iniciar_sesion(aut, "55:66:77:88", "1", "2", "3")
+    print("-- Ahora intenta con el PIN correcto:")
+    _iniciar_sesion(aut, "55:66:77:88", "0000")
+
+
+# =====================================================================
+# PROGRAMA PRINCIPAL
+# =====================================================================
+
+def main(argv: list[str]) -> None:
+    if argv and argv[0].lower() == "listar":
+        listar_puertos()
+        return
+    if argv and argv[0].lower() == "demo":
+        ejecutar_demo()
+        return
+
+    autenticador = crear_autenticador()
+    lector: LectorTarjeta
+    try:
+        if argv:
+            lector = LectorSerial(argv[0])
+            print("Modo REAL. Acerque una tarjeta al lector...")
+        else:
+            lector = LectorSimulado()
+            print("Modo SIMULADO. Escriba un UID (ej: A3:4F:12:8B) o 'salir'.")
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+    try:
+        while True:
+            uid = lector.esperar_tarjeta()
+            if uid is None:
+                break
+            atender_sesion(autenticador, uid)
+            if argv:
+                print("\nAcerque una tarjeta al lector...")
+    except (EOFError, KeyboardInterrupt):
+        print("\nHasta luego.")
+    except RuntimeError as e:
+        print(f"\nERROR: {e}")
+        sys.exit(1)
+    finally:
+        lector.cerrar()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+
